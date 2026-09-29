@@ -98,7 +98,3 @@ Open the `.sln` in Visual Studio, restore NuGet packages, build.
 
 Built by **Praveen Kumar Ellappa** — CRM Architect specializing in
 Microsoft Dynamics 365 and the Power Platform.
-
-## License
-
-MIT — free to use, modify, and distribute.
