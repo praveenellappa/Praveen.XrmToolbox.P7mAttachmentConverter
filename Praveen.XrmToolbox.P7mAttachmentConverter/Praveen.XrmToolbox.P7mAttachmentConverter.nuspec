@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package>
+  <metadata>
+    <id>Praveen.XrmToolbox.P7mAttachmentConverter</id>
+    <version>1.0.0.5</version>
+    <title>P7M Attachment Converter</title>
+    <authors>Praveen Kumar Ellappa</authors>
+    <owners>Praveen Kumar Ellappa</owners>
+    <projectUrl>https://github.com/praveenellappa/Praveen.XrmToolbox.P7mAttachmentConverter</projectUrl>
+    <iconUrl>https://raw.githubusercontent.com/praveenellappa/Praveen.XrmToolbox.P7mAttachmentConverter/master/P7Mlogo.png</iconUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <description>Finds .p7m (PKCS#7/S-MIME) attachments on Dynamics 365 records and converts them back to their original readable file.</description>
+    <summary>Converts .p7m attachments in Dynamics 365 back to readable files.</summary>
+    <releaseNotes>
+      1.0.0.1: Initial release.
+    </releaseNotes>
+    <copyright>Copyright 2026 Praveen Kumar Ellappa</copyright>
+    <tags>XrmToolBox P7M PKCS7 Attachments</tags>
+    <dependencies>
+      <dependency id="XrmToolBox" version="1.2025.10.74" />
+    </dependencies>
+  </metadata>
+  <files>
+    <file src="bin\Release\Praveen.XrmToolbox.P7mAttachmentConverter.dll" target="lib\net48\Plugins" />
+  </files>
+</package>

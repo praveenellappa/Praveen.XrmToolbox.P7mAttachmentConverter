@@ -66,8 +66,12 @@ namespace Praveen.XrmToolbox.P7mAttachmentConverter
                 Dock = DockStyle.Fill,
                 AutoGenerateColumns = false,
                 SelectionMode = DataGridViewSelectionMode.FullRowSelect,
-                AllowUserToAddRows = false,
-                ReadOnly = true
+                AllowUserToAddRows = false
+                // NOTE: grid-level ReadOnly is intentionally NOT set here.
+                // DataGridView.ReadOnly=true overrides every column's own
+                // ReadOnly setting, which silently blocked the checkbox
+                // column below from ever being toggled. Instead, each
+                // non-checkbox column is marked ReadOnly individually.
             };
 
             _grid.Columns.Add(new DataGridViewCheckBoxColumn
@@ -82,22 +86,33 @@ namespace Praveen.XrmToolbox.P7mAttachmentConverter
                 Name = "FileName",
                 HeaderText = "File Name",
                 DataPropertyName = "FileName",
-                Width = 300
+                Width = 300,
+                ReadOnly = true
             });
             _grid.Columns.Add(new DataGridViewTextBoxColumn
             {
                 Name = "RegardingId",
                 HeaderText = "Regarding Record",
                 DataPropertyName = "RegardingId",
-                Width = 260
+                Width = 260,
+                ReadOnly = true
             });
             _grid.Columns.Add(new DataGridViewTextBoxColumn
             {
                 Name = "Status",
                 HeaderText = "Status",
                 DataPropertyName = "Status",
-                Width = 200
+                Width = 200,
+                ReadOnly = true
             });
+
+            _grid.CurrentCellDirtyStateChanged += (s, e) =>
+            {
+                if (_grid.CurrentCell is DataGridViewCheckBoxCell)
+                {
+                    _grid.CommitEdit(DataGridViewDataErrorContexts.Commit);
+                }
+            };
 
             this.Controls.Add(_grid);
             this.Controls.Add(_progressBar);
@@ -228,6 +243,33 @@ namespace Praveen.XrmToolbox.P7mAttachmentConverter
                             byte[] p7mBytes = Convert.FromBase64String(row.DocumentBody);
                             byte[] originalBytes;
                             string innerContentType = null;
+
+                            // A valid DER-encoded PKCS#7/CMS blob always starts with
+                            // the ASN.1 SEQUENCE tag (0x30). If it doesn't, the bytes
+                            // we have are very likely still Base64 TEXT rather than
+                            // binary — this happens when the .p7m arrived as a MIME
+                            // email attachment and whatever process synced it into
+                            // CRM stored the raw (still-Base64) MIME part content
+                            // instead of decoding it first. In that case we need a
+                            // second Base64 decode before the bytes are real DER.
+                            if (p7mBytes.Length == 0 || p7mBytes[0] != 0x30)
+                            {
+                                try
+                                {
+                                    string asText = System.Text.Encoding.ASCII.GetString(p7mBytes)
+                                        .Replace("\r", "").Replace("\n", "").Trim();
+                                    byte[] doubleDecoded = Convert.FromBase64String(asText);
+                                    if (doubleDecoded.Length > 0 && doubleDecoded[0] == 0x30)
+                                    {
+                                        p7mBytes = doubleDecoded;
+                                    }
+                                }
+                                catch (FormatException)
+                                {
+                                    // Not valid Base64 text either — fall through and
+                                    // let SignedCms/EnvelopedCms report the real error.
+                                }
+                            }
 
                             try
                             {
