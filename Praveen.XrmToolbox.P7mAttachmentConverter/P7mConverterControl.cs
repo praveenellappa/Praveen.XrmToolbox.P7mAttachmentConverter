@@ -91,6 +91,14 @@ namespace Praveen.XrmToolbox.P7mAttachmentConverter
             });
             _grid.Columns.Add(new DataGridViewTextBoxColumn
             {
+                Name = "Source",
+                HeaderText = "Source",
+                DataPropertyName = "Source",
+                Width = 120,
+                ReadOnly = true
+            });
+            _grid.Columns.Add(new DataGridViewTextBoxColumn
+            {
                 Name = "RegardingId",
                 HeaderText = "Regarding Record",
                 DataPropertyName = "RegardingId",
@@ -139,6 +147,7 @@ namespace Praveen.XrmToolbox.P7mAttachmentConverter
         private class AttachmentRow
         {
             public bool Selected { get; set; }
+            public string Source { get; set; }
             public Guid AnnotationId { get; set; }
             public string FileName { get; set; }
             public EntityReference RegardingRef { get; set; }
@@ -170,14 +179,55 @@ namespace Praveen.XrmToolbox.P7mAttachmentConverter
                 Message = "Retrieving .p7m attachments...",
                 Work = (worker, args) =>
                 {
-                    var query = new QueryExpression("annotation")
+                    var found = new List<AttachmentRow>();
+
+                    // 1) Notes (annotation)
+                    var noteQuery = new QueryExpression("annotation")
                     {
                         ColumnSet = new ColumnSet("filename", "documentbody", "objectid", "mimetype", "subject")
                     };
-                    query.Criteria.AddCondition("filename", ConditionOperator.EndsWith, ".p7m");
-                    query.TopCount = 500;
+                    noteQuery.Criteria.AddCondition("filename", ConditionOperator.EndsWith, ".p7m");
+                    noteQuery.TopCount = 500;
 
-                    args.Result = Service.RetrieveMultiple(query);
+                    foreach (var e in Service.RetrieveMultiple(noteQuery).Entities)
+                    {
+                        found.Add(new AttachmentRow
+                        {
+                            Source = "Note",
+                            AnnotationId = e.Id,
+                            FileName = e.GetAttributeValue<string>("filename"),
+                            RegardingRef = e.GetAttributeValue<EntityReference>("objectid"),
+                            DocumentBody = e.GetAttributeValue<string>("documentbody")
+                        });
+                    }
+
+                    // 2) Email attachments (activitymimeattachment) — what
+                    //    server-side sync creates for incoming emails.
+                    var mailQuery = new QueryExpression("activitymimeattachment")
+                    {
+                        ColumnSet = new ColumnSet("filename", "body", "objectid", "objecttypecode", "mimetype", "subject")
+                    };
+                    mailQuery.Criteria.AddCondition("filename", ConditionOperator.EndsWith, ".p7m");
+                    mailQuery.TopCount = 500;
+
+                    foreach (var e in Service.RetrieveMultiple(mailQuery).Entities)
+                    {
+                        var parent = e.GetAttributeValue<EntityReference>("objectid");
+                        string typeCode = e.Contains("objecttypecode") ? e["objecttypecode"]?.ToString() : null;
+                        if (parent != null && string.IsNullOrEmpty(typeCode)) typeCode = parent.LogicalName;
+                        if (string.IsNullOrEmpty(typeCode) || typeCode == "activitypointer") typeCode = "email";
+
+                        found.Add(new AttachmentRow
+                        {
+                            Source = "Email attachment",
+                            AnnotationId = e.Id,
+                            FileName = e.GetAttributeValue<string>("filename"),
+                            RegardingRef = parent == null ? null : new EntityReference(typeCode, parent.Id),
+                            DocumentBody = e.GetAttributeValue<string>("body")
+                        });
+                    }
+
+                    args.Result = found;
                 },
                 PostWorkCallBack = (args) =>
                 {
@@ -190,23 +240,13 @@ namespace Praveen.XrmToolbox.P7mAttachmentConverter
                         return;
                     }
 
-                    var results = (EntityCollection)args.Result;
-                    foreach (var e in results.Entities)
-                    {
-                        _rows.Add(new AttachmentRow
-                        {
-                            AnnotationId = e.Id,
-                            FileName = e.GetAttributeValue<string>("filename"),
-                            RegardingRef = e.GetAttributeValue<EntityReference>("objectid"),
-                            DocumentBody = e.GetAttributeValue<string>("documentbody")
-                        });
-                    }
+                    _rows.AddRange((List<AttachmentRow>)args.Result);
 
                     _bindingSource = new BindingSource { DataSource = _rows };
                     _grid.DataSource = _bindingSource;
                     _grid.Columns["Selected"].DataPropertyName = "Selected";
 
-                    _statusLabel.Text = $"Found {_rows.Count} .p7m attachment(s).";
+                    _statusLabel.Text = $"Found {_rows.Count} .p7m attachment(s) (notes + email attachments).";
                     _btnConvert.Enabled = _rows.Count > 0;
                 }
             });
@@ -238,74 +278,41 @@ namespace Praveen.XrmToolbox.P7mAttachmentConverter
                     int done = 0;
                     foreach (var row in selected)
                     {
+                        byte[] rawBytes = null;
                         try
                         {
                             byte[] p7mBytes = Convert.FromBase64String(row.DocumentBody);
-                            byte[] originalBytes;
-                            string innerContentType = null;
+                            rawBytes = p7mBytes;
 
-                            // A valid DER-encoded PKCS#7/CMS blob always starts with
-                            // the ASN.1 SEQUENCE tag (0x30). If it doesn't, the bytes
-                            // we have are very likely still Base64 TEXT rather than
-                            // binary — this happens when the .p7m arrived as a MIME
-                            // email attachment and whatever process synced it into
-                            // CRM stored the raw (still-Base64) MIME part content
-                            // instead of decoding it first. In that case we need a
-                            // second Base64 decode before the bytes are real DER.
-                            if (p7mBytes.Length == 0 || p7mBytes[0] != 0x30)
-                            {
-                                try
-                                {
-                                    string asText = System.Text.Encoding.ASCII.GetString(p7mBytes)
-                                        .Replace("\r", "").Replace("\n", "").Trim();
-                                    byte[] doubleDecoded = Convert.FromBase64String(asText);
-                                    if (doubleDecoded.Length > 0 && doubleDecoded[0] == 0x30)
-                                    {
-                                        p7mBytes = doubleDecoded;
-                                    }
-                                }
-                                catch (FormatException)
-                                {
-                                    // Not valid Base64 text either — fall through and
-                                    // let SignedCms/EnvelopedCms report the real error.
-                                }
-                            }
-
-                            try
-                            {
-                                var signedCms = new SignedCms();
-                                signedCms.Decode(p7mBytes);
-                                originalBytes = signedCms.ContentInfo.Content;
-                                innerContentType = signedCms.ContentInfo.ContentType?.Value;
-                            }
-                            catch (System.Security.Cryptography.CryptographicException)
-                            {
-                                var envelopedCms = new EnvelopedCms();
-                                envelopedCms.Decode(p7mBytes);
-                                envelopedCms.Decrypt();
-                                originalBytes = envelopedCms.ContentInfo.Content;
-                                innerContentType = envelopedCms.ContentInfo.ContentType?.Value;
-                            }
-
-                            string originalFileName = row.FileName.EndsWith(".p7m", StringComparison.OrdinalIgnoreCase)
+                            string fallbackName = row.FileName.EndsWith(".p7m", StringComparison.OrdinalIgnoreCase)
                                 ? row.FileName.Substring(0, row.FileName.Length - 4)
                                 : row.FileName + ".decoded";
 
-                            var newNote = new Entity("annotation");
-                            newNote["subject"] = "Converted from P7M: " + originalFileName;
-                            newNote["filename"] = originalFileName;
-                            newNote["documentbody"] = Convert.ToBase64String(originalBytes);
-                            newNote["mimetype"] = GuessMimeType(originalFileName, innerContentType);
-                            if (row.RegardingRef != null)
-                                newNote["objectid"] = row.RegardingRef;
+                            // Handles binary PKCS#7, Base64/PEM text, and S/MIME
+                            // messages (clear-signed multipart/signed or opaque).
+                            var files = ExtractFiles(p7mBytes, fallbackName, 0);
+                            if (files.Count == 0)
+                                throw new InvalidOperationException("No attachment found inside the P7M content.");
 
-                            Service.Create(newNote);
+                            foreach (var f in files)
+                            {
+                                var newNote = new Entity("annotation");
+                                newNote["subject"] = "Converted from P7M: " + f.Name;
+                                newNote["filename"] = f.Name;
+                                newNote["documentbody"] = Convert.ToBase64String(f.Data);
+                                newNote["mimetype"] = GuessMimeType(f.Name, f.ContentType);
+                                if (row.RegardingRef != null)
+                                    newNote["objectid"] = row.RegardingRef;
+                                Service.Create(newNote);
+                            }
 
-                            row.Status = "Converted OK";
+                            row.Status = "Converted OK: " + string.Join(", ", files.ConvertAll(x => x.Name));
                         }
                         catch (Exception ex)
                         {
-                            row.Status = "FAILED: " + ex.Message;
+                            row.Status = "FAILED: " + ex.Message + " | v"
+                                + System.Reflection.Assembly.GetExecutingAssembly().GetName().Version
+                                + " | " + Describe(rawBytes);
                         }
 
                         done++;
@@ -337,6 +344,207 @@ namespace Praveen.XrmToolbox.P7mAttachmentConverter
         }
 
         // ---------- HELPERS ----------
+
+        private class ExtractedFile
+        {
+            public string Name;
+            public string ContentType;
+            public byte[] Data;
+        }
+
+        private static readonly System.Text.Encoding Latin1 = System.Text.Encoding.GetEncoding(28591);
+
+        private static bool LooksLikeMime(byte[] data)
+        {
+            int n = Math.Min(512, data.Length);
+            string head = Latin1.GetString(data, 0, n).TrimStart();
+            return head.StartsWith("Content-Type:", StringComparison.OrdinalIgnoreCase)
+                || head.StartsWith("MIME-Version:", StringComparison.OrdinalIgnoreCase)
+                || head.StartsWith("Content-Transfer-Encoding:", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static List<ExtractedFile> ExtractFiles(byte[] data, string fallbackName, int depth)
+        {
+            var results = new List<ExtractedFile>();
+            if (depth > 5) return results;
+
+            // S/MIME message stored as text (clear-signed multipart/signed, or
+            // opaque application/pkcs7-mime with MIME headers).
+            if (LooksLikeMime(data))
+            {
+                ExtractFromMime(Latin1.GetString(data), fallbackName, results, depth);
+                return results;
+            }
+
+            // Binary PKCS#7 (possibly wrapped in Base64 text / PEM).
+            byte[] der = NormalizeToDer(data);
+            byte[] content;
+            string contentType = null;
+            try
+            {
+                var signedCms = new SignedCms();
+                signedCms.Decode(der);
+                content = signedCms.ContentInfo.Content;
+                contentType = signedCms.ContentInfo.ContentType?.Value;
+            }
+            catch (System.Security.Cryptography.CryptographicException)
+            {
+                var envelopedCms = new EnvelopedCms();
+                envelopedCms.Decode(der);
+                envelopedCms.Decrypt();
+                content = envelopedCms.ContentInfo.Content;
+                contentType = envelopedCms.ContentInfo.ContentType?.Value;
+            }
+
+            // The signed content of a real S/MIME message is itself a MIME entity.
+            if (LooksLikeMime(content))
+                return ExtractFiles(content, fallbackName, depth + 1);
+
+            results.Add(new ExtractedFile { Name = fallbackName, ContentType = contentType, Data = content });
+            return results;
+        }
+
+        private static void ExtractFromMime(string text, string fallbackName, List<ExtractedFile> results, int depth)
+        {
+            int sepLen = 4;
+            int idx = text.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+            int idx2 = text.IndexOf("\n\n", StringComparison.Ordinal);
+            if (idx < 0 || (idx2 >= 0 && idx2 < idx)) { idx = idx2; sepLen = 2; }
+            if (idx < 0) return;
+
+            string head = System.Text.RegularExpressions.Regex.Replace(text.Substring(0, idx), @"\r?\n[ \t]+", " ");
+            string body = text.Substring(idx + sepLen);
+
+            var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var line in head.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                int c = line.IndexOf(':');
+                if (c > 0) headers[line.Substring(0, c).Trim()] = line.Substring(c + 1).Trim();
+            }
+
+            string ct = headers.ContainsKey("Content-Type") ? headers["Content-Type"] : "text/plain";
+            string mediaType = ct.Split(';')[0].Trim().ToLowerInvariant();
+            string cte = headers.ContainsKey("Content-Transfer-Encoding")
+                ? headers["Content-Transfer-Encoding"].Trim().ToLowerInvariant() : "7bit";
+
+            if (mediaType.StartsWith("multipart/"))
+            {
+                string boundary = GetParam(ct, "boundary");
+                if (boundary == null) return;
+                var parts = body.Split(new[] { "--" + boundary }, StringSplitOptions.None);
+                for (int i = 1; i < parts.Length; i++)
+                {
+                    if (parts[i].StartsWith("--")) break; // closing delimiter
+                    ExtractFromMime(parts[i].TrimStart('\r', '\n'), fallbackName, results, depth);
+                }
+                return;
+            }
+
+            if (mediaType.Contains("pkcs7-signature")) return; // detached signature, not content
+
+            byte[] bytes = DecodeBody(body, cte);
+
+            if (mediaType.Contains("pkcs7-mime"))
+            {
+                results.AddRange(ExtractFiles(bytes, fallbackName, depth + 1));
+                return;
+            }
+
+            string cd = headers.ContainsKey("Content-Disposition") ? headers["Content-Disposition"] : null;
+            string name = GetParam(cd, "filename") ?? GetParam(ct, "name");
+            if (name == null) return; // message body text, not an attachment
+
+            results.Add(new ExtractedFile { Name = name, ContentType = mediaType, Data = bytes });
+        }
+
+        private static string GetParam(string header, string param)
+        {
+            if (string.IsNullOrEmpty(header)) return null;
+            var m = System.Text.RegularExpressions.Regex.Match(header,
+                @"(?<![A-Za-z0-9*])" + param + @"\s*=\s*(?:""([^""]*)""|([^;\s]+))",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (!m.Success) return null;
+            return m.Groups[1].Success ? m.Groups[1].Value : m.Groups[2].Value;
+        }
+
+        private static byte[] DecodeBody(string body, string cte)
+        {
+            if (cte == "base64")
+            {
+                string clean = new string(Array.FindAll(body.ToCharArray(), c => !char.IsWhiteSpace(c)));
+                return Convert.FromBase64String(clean);
+            }
+            if (cte == "quoted-printable")
+            {
+                var ms = new System.IO.MemoryStream();
+                string s = body.Replace("=\r\n", "").Replace("=\n", "");
+                for (int i = 0; i < s.Length; i++)
+                {
+                    if (s[i] == '=' && i + 2 < s.Length + 0 && Uri.IsHexDigit(s[i + 1]) && Uri.IsHexDigit(s[i + 2]))
+                    {
+                        ms.WriteByte(Convert.ToByte(s.Substring(i + 1, 2), 16));
+                        i += 2;
+                    }
+                    else ms.WriteByte((byte)s[i]);
+                }
+                return ms.ToArray();
+            }
+            return Latin1.GetBytes(body);
+        }
+
+        // Shows length, first bytes (hex) and an ASCII preview, so a failing
+        // file can be diagnosed without exposing its full contents.
+        private static string Describe(byte[] b)
+        {
+            if (b == null) return "no data";
+            int n = Math.Min(24, b.Length);
+            var sb = new System.Text.StringBuilder();
+            for (int i = 0; i < n; i++)
+                sb.Append((b[i] >= 32 && b[i] < 127) ? (char)b[i] : '.');
+            return "len=" + b.Length + " hex=" + (n > 0 ? BitConverter.ToString(b, 0, n) : "") + " txt=" + sb;
+        }
+
+        // Turns whatever was stored into raw DER: handles raw DER, Base64 text,
+        // PEM blocks, and full MIME messages (headers + Base64 body).
+        private static byte[] NormalizeToDer(byte[] data)
+        {
+            for (int pass = 0; pass < 3; pass++)
+            {
+                if (data.Length > 0 && data[0] == 0x30) return data;
+
+                string text = System.Text.Encoding.ASCII.GetString(data);
+
+                int begin = text.IndexOf("-----BEGIN", StringComparison.Ordinal);
+                if (begin >= 0)
+                {
+                    int bodyStart = text.IndexOf('\n', begin);
+                    int end = text.IndexOf("-----END", StringComparison.Ordinal);
+                    if (bodyStart > 0 && end > bodyStart)
+                        text = text.Substring(bodyStart + 1, end - bodyStart - 1);
+                }
+                else
+                {
+                    // MIME message: drop headers (everything up to first blank line).
+                    int sep = text.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+                    int sepLen = 4;
+                    if (sep < 0) { sep = text.IndexOf("\n\n", StringComparison.Ordinal); sepLen = 2; }
+                    if (sep >= 0 && text.IndexOf(':') >= 0 && text.IndexOf(':') < sep)
+                        text = text.Substring(sep + sepLen);
+                }
+
+                string clean = new string(Array.FindAll(text.ToCharArray(), c => !char.IsWhiteSpace(c)));
+                try
+                {
+                    data = Convert.FromBase64String(clean);
+                }
+                catch (FormatException)
+                {
+                    return data;
+                }
+            }
+            return data;
+        }
+
         private static string GuessMimeType(string fileName, string innerContentType)
         {
             if (!string.IsNullOrEmpty(innerContentType))
